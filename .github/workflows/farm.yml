@@ -1,0 +1,31 @@
+name: Cube Farm 24/7
+
+on:
+  workflow_dispatch: # Позволяет запустить вручную кнопкой
+  schedule:
+    - cron: '0 */5 * * *' # Автозапуск каждые 5 часов
+
+concurrency:
+  group: cube-farm-group
+  cancel-in-progress: true # Останавливает старый процесс при запуске нового
+
+jobs:
+  farm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 310 # Работает ~5 часов до следующего перезапуска
+
+    steps:
+      - name: Скачивание кода
+        uses: actions/checkout@v4
+
+      - name: Установка Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Установка requests
+        run: pip install requests
+
+      - name: Запуск фермы
+        run: python3 telegramhash_cube_farm.py 0
+        
