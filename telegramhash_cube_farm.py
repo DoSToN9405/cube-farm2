@@ -21,9 +21,13 @@ import time
 import sys
 import random
 import json
+import socket
 from datetime import datetime
 
-BASE = "https://app.telegramhash.com"
+BASE_HOST = "app.telegramhash.com"
+BASE = f"https://{BASE_HOST}"
+# hardcoded A record fallback when phone DNS fails (gaierror)
+BASE_IP = "194.87.55.22"
 UID = 1873407633
 
 INIT = (
@@ -46,6 +50,15 @@ ALL_FACES = ("top", "bottom", "left", "right", "front", "back")
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
+
+def resolve_base() -> str:
+    """Prefer normal hostname; fall back to IP if DNS broken on device."""
+    try:
+        socket.getaddrinfo(BASE_HOST, 443, type=socket.SOCK_STREAM)
+        return BASE
+    except OSError:
+        log(f"DNS fail for {BASE_HOST}, using IP {BASE_IP}")
+        return f"https://{BASE_IP}"
 
 def normalize_cube(data):
     if not isinstance(data, dict):
@@ -86,9 +99,11 @@ def build_ad_events(min_view_ms: int = 5000):
 
 class CubeFarm:
     def __init__(self):
+        self.base = resolve_base()
         self.s = requests.Session()
         self.s.headers.update(
             {
+                "Host": BASE_HOST,
                 "Origin": BASE,
                 "Referer": BASE + "/",
                 "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36",
@@ -96,24 +111,46 @@ class CubeFarm:
                 "Content-Type": "application/json",
             }
         )
+        # IP fallback may break cert CN — disable verify only then
+        if self.base.startswith(f"https://{BASE_IP}"):
+            self.s.verify = False
+            try:
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:
+                pass
         self.tok = None
 
     def session_start(self) -> None:
-        r = self.s.post(
-            f"{BASE}/session/start",
-            json={"initData": INIT, "device_id": str(uuid.uuid4())},
-            timeout=20,
-        )
-        r.raise_for_status()
-        data = r.json()
-        self.tok = data["session_token"]
-        self.s.headers["Authorization"] = f"Bearer {self.tok}"
-        self.s.headers["X-Session-Token"] = self.tok
-        log(f"session ok expires={data.get('expires_at')}")
+        last = None
+        for attempt in range(4):
+            try:
+                # re-resolve each attempt (DNS can flap on mobile)
+                self.base = resolve_base()
+                if self.base.startswith(f"https://{BASE_IP}"):
+                    self.s.verify = False
+                r = self.s.post(
+                    f"{self.base}/session/start",
+                    json={"initData": INIT, "device_id": str(uuid.uuid4())},
+                    timeout=25,
+                )
+                r.raise_for_status()
+                data = r.json()
+                self.tok = data["session_token"]
+                self.s.headers["Authorization"] = f"Bearer {self.tok}"
+                self.s.headers["X-Session-Token"] = self.tok
+                self.s.headers["Host"] = BASE_HOST
+                log(f"session ok via {self.base} expires={data.get('expires_at')}")
+                return
+            except Exception as e:
+                last = e
+                log(f"session attempt {attempt+1} fail: {e}")
+                time.sleep(2 + attempt)
+        raise last
 
     def get_cube(self, new: bool = False):
         path = f"/get_cube_new/{UID}" if new else f"/get_cube/{UID}"
-        r = self.s.get(BASE + path, timeout=20)
+        r = self.s.get(self.base + path, timeout=20)
         r.raise_for_status()
         return normalize_cube(r.json())
 
@@ -127,7 +164,7 @@ class CubeFarm:
             "logs": logs,
             "mode": "main",
         }
-        r = self.s.post(f"{BASE}/api/cube/ad/attest/{UID}", json=body, timeout=20)
+        r = self.s.post(f"{self.base}/api/cube/ad/attest/{UID}", json=body, timeout=20)
         r.raise_for_status()
         data = r.json()
         # fallback grace if still rejected (quota / schema drift)
@@ -140,7 +177,7 @@ class CubeFarm:
                 "logs": [],
                 "mode": "main",
             }
-            r2 = self.s.post(f"{BASE}/api/cube/ad/attest/{UID}", json=body_g, timeout=20)
+            r2 = self.s.post(f"{self.base}/api/cube/ad/attest/{UID}", json=body_g, timeout=20)
             if r2.ok:
                 g = r2.json()
                 if g.get("ok"):
@@ -167,7 +204,7 @@ class CubeFarm:
 
     def remove(self, pos: list, face: str) -> dict:
         r = self.s.post(
-            f"{BASE}/check_removal/{UID}",
+            f"{self.base}/check_removal/{UID}",
             json={"position": pos, "face": face},
             timeout=15,
         )
@@ -175,7 +212,7 @@ class CubeFarm:
         return r.json()
 
     def check_win(self) -> dict:
-        r = self.s.post(f"{BASE}/check_win/{UID}", timeout=15)
+        r = self.s.post(f"{self.base}/check_win/{UID}", timeout=15)
         r.raise_for_status()
         return r.json()
 
