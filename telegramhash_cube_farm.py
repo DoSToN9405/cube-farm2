@@ -40,7 +40,7 @@ INIT = os.environ.get("TH_INIT") or (
 )
 
 GAMES = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-DELAY_BETWEEN_GAMES = 8.0
+DELAY_BETWEEN_GAMES = 4.0
 DELAY_BETWEEN_TAPS = 0.10
 MIN_GAME_SECONDS = 11.0
 WIN_PAUSE = 1.5
