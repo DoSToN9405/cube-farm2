@@ -3,9 +3,12 @@
 TelegramHash Cube Dostiyor farm
 tg: 1873407633
 
-409 Conflict / session_superseded:
-  server allows ONE live session per user. second session/start kills the first.
-  do NOT run two farms on same account. on 409: backoff, re-auth once, continue.
+speed notes:
+  server rejects check_win with "Too fast!" if clear < ~12-15s wall time.
+  bottleneck is min game duration, not tap spacing.
+  we clear as fast as possible, then wait only the remaining min window.
+
+409 session_superseded: only ONE client per uid (Actions XOR termux).
 
 usage:
   python3 telegramhash_cube_farm.py
@@ -14,7 +17,6 @@ usage:
 """
 
 import atexit
-import json
 import os
 import random
 import socket
@@ -40,13 +42,20 @@ INIT = os.environ.get("TH_INIT") or (
 )
 
 GAMES = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-DELAY_BETWEEN_GAMES = 4.0
-DELAY_BETWEEN_TAPS = 0.10
-MIN_GAME_SECONDS = 11.0
-WIN_PAUSE = 1.5
+
+# --- speed knobs ---
+DELAY_BETWEEN_GAMES = 1.2          # was 3.5
+DELAY_BETWEEN_TAPS = 0.0           # fire next face ASAP on fail
+MIN_GAME_SECONDS = 13.0            # server "too fast" floor ~12-15s
+WIN_PAUSE = 0.4
+AD_PAUSE = 0.15
+RESYNC_PAUSE = 0.05
+MAX_CLEAR_SEC = 75
 ALL_FACES = ("top", "bottom", "left", "right", "front", "back")
+
 LOCK_PATH = (
-    "/tmp/cube_farm.lock" if os.environ.get("GITHUB_ACTIONS")
+    "/tmp/cube_farm.lock"
+    if os.environ.get("GITHUB_ACTIONS")
     else os.path.join(os.path.dirname(os.path.abspath(__file__)) or ".", ".cube_farm.lock")
 )
 
@@ -56,14 +65,13 @@ def log(msg: str) -> None:
 
 
 def acquire_lock() -> None:
-    """Single local instance. Stale lock (>2h) is overwritten."""
     if os.path.exists(LOCK_PATH):
         try:
             age = time.time() - os.path.getmtime(LOCK_PATH)
             with open(LOCK_PATH) as f:
                 old = f.read().strip()
             if age < 7200:
-                log(f"LOCK busy pid/info={old} age={int(age)}s — stop other farm or rm {LOCK_PATH}")
+                log(f"LOCK busy {old} age={int(age)}s — stop other instance or rm {LOCK_PATH}")
                 sys.exit(2)
             log(f"stale lock age={int(age)}s, taking over")
         except Exception:
@@ -88,7 +96,7 @@ def resolve_base() -> str:
         socket.getaddrinfo(BASE_HOST, 443, type=socket.SOCK_STREAM)
         return BASE
     except OSError:
-        log(f"DNS fail for {BASE_HOST}, using IP {BASE_IP}")
+        log(f"DNS fail {BASE_HOST} -> IP {BASE_IP}")
         return f"https://{BASE_IP}"
 
 
@@ -139,7 +147,7 @@ class SessionSuperseded(Exception):
 class RateLimited(Exception):
     def __init__(self, wait: float = 30.0):
         self.wait = wait
-        super().__init__(f"rate/conflict wait {wait}s")
+        super().__init__(f"rate wait {wait}s")
 
 
 class CubeFarm:
@@ -182,7 +190,7 @@ class CubeFarm:
                     err = str(d)
             if "superseded" in err.lower() or "session" in err.lower():
                 raise SessionSuperseded(str(detail))
-            raise RateLimited(45.0)
+            raise RateLimited(40.0)
         r.raise_for_status()
 
     def session_start(self) -> None:
@@ -204,16 +212,16 @@ class CubeFarm:
                 self.s.headers["X-Session-Token"] = self.tok
                 self.s.headers["Host"] = BASE_HOST
                 self._conflict_streak = 0
-                log(f"session ok via {self.base} expires={data.get('expires_at')}")
+                log(f"session ok expires={data.get('expires_at')}")
                 return
             except SessionSuperseded as e:
                 last = e
-                log(f"session superseded attempt {attempt+1}")
-                time.sleep(3 + attempt)
+                log(f"session superseded {attempt+1}")
+                time.sleep(2 + attempt)
             except Exception as e:
                 last = e
-                log(f"session attempt {attempt+1} fail: {e}")
-                time.sleep(2 + attempt)
+                log(f"session fail {attempt+1}: {e}")
+                time.sleep(1.5 + attempt)
         raise last
 
     def get_cube(self, new: bool = False):
@@ -256,13 +264,7 @@ class CubeFarm:
         return data
 
     def ensure_cube(self) -> dict:
-        state = None
-        try:
-            state = self.get_cube(new=True)
-        except RateLimited:
-            raise
-        except SessionSuperseded:
-            raise
+        state = self.get_cube(new=True)
         if state is None:
             state = self.get_cube(False)
         if isinstance(state, dict) and state.get("ad_required"):
@@ -270,15 +272,14 @@ class CubeFarm:
             res = self.attest_ad(state["ad_session"], state.get("min_view_ms", 5000))
             log(f"attest {res}")
             if not res.get("ok") and not res.get("idempotent"):
-                # grace_limit — wait and retry once
                 if res.get("reason") == "grace_limit":
-                    log("grace_limit — sleep 60s")
-                    time.sleep(60)
+                    log("grace_limit sleep 45s")
+                    time.sleep(45)
                     res = self.attest_ad(state["ad_session"], state.get("min_view_ms", 5000))
                     log(f"attest retry {res}")
                 if not res.get("ok") and not res.get("idempotent"):
                     raise RuntimeError(f"ad blocked: {res}")
-            time.sleep(0.5)
+            time.sleep(AD_PAUSE)
             state = self.get_cube(new=True)
             if state is None or (isinstance(state, dict) and state.get("ad_required")):
                 state = self.get_cube(False)
@@ -290,7 +291,7 @@ class CubeFarm:
         r = self.s.post(
             f"{self.base}/check_removal/{UID}",
             json={"position": pos, "face": face},
-            timeout=15,
+            timeout=12,
         )
         self._raise_http(r)
         return r.json()
@@ -301,6 +302,7 @@ class CubeFarm:
         return r.json()
 
     def try_remove_cell(self, pos: list, faces) -> dict:
+        # listed faces first (usually one is reachable), then remaining
         ordered = []
         for f in list(faces or []):
             if f not in ordered:
@@ -312,28 +314,26 @@ class CubeFarm:
         for face in ordered:
             try:
                 res = self.remove(pos, face)
-            except SessionSuperseded:
+            except (SessionSuperseded, RateLimited):
                 raise
-            except RateLimited:
-                raise
-            except Exception as e:
-                # soft errors only
-                if "409" in str(e):
-                    raise RateLimited(30.0)
+            except Exception:
                 continue
-            time.sleep(DELAY_BETWEEN_TAPS + random.uniform(0, 0.04))
             last = res
             if res.get("success"):
                 return res
+            # unreachable/invalid — next face immediately
+            if DELAY_BETWEEN_TAPS > 0:
+                time.sleep(DELAY_BETWEEN_TAPS)
         return last
 
     def clear_cube(self, state: dict) -> bool:
         t0 = time.time()
         idle_rounds = 0
-        for _round in range(30):
+        for _round in range(40):
             if not state:
                 return True
             progress = 0
+            # outer-ish order helps less than trying every face; shuffle is fine
             keys = list(state.keys())
             random.shuffle(keys)
             for key in keys:
@@ -346,26 +346,24 @@ class CubeFarm:
                 if res.get("success"):
                     progress += 1
                     if res.get("last"):
-                        log(f"last cell {pos}")
+                        log(f"last cell {pos} clear={time.time()-t0:.1f}s")
                         return True
-            time.sleep(0.2)
+            if RESYNC_PAUSE:
+                time.sleep(RESYNC_PAUSE)
             state = self.get_cube(False)
-            if state is None:
+            if state is None or not state:
                 return True
             if isinstance(state, dict) and state.get("ad_required"):
-                log("unexpected ad mid-clear")
+                log("ad mid-clear")
                 break
-            if not state:
-                return True
             if progress == 0:
                 idle_rounds += 1
-                log(f"stuck cells={len(state)} retry={idle_rounds}")
-                if idle_rounds >= 5:
-                    log(f"give up: {list(state.keys())}")
+                if idle_rounds >= 4:
+                    log(f"stuck {len(state)} cells")
                     break
             else:
                 idle_rounds = 0
-            if time.time() - t0 > 90:
+            if time.time() - t0 > MAX_CLEAR_SEC:
                 log("clear timeout")
                 break
         return False
@@ -376,14 +374,19 @@ class CubeFarm:
         log(f"cube cells={len(state)}")
         last = self.clear_cube(state)
         elapsed = time.time() - t0
+        # only wait remaining floor so check_win is accepted
         wait = max(0.0, MIN_GAME_SECONDS - elapsed) + WIN_PAUSE
         if wait > 0:
             time.sleep(wait)
         win = self.check_win()
         if not win.get("success"):
-            time.sleep(4)
+            msg = str(win.get("message", "")).lower()
+            if "fast" in msg:
+                time.sleep(3.5)
+            else:
+                time.sleep(2.0)
             win = self.check_win()
-        log(f"win last={last} -> {win}")
+        log(f"win last={last} t={time.time()-t0:.1f}s -> {win}")
         return win
 
 
@@ -400,20 +403,18 @@ def main() -> None:
             farm._conflict_streak = 0
         except SessionSuperseded as e:
             farm._conflict_streak += 1
-            log(f"session_superseded (another client?) streak={farm._conflict_streak}: {e}")
-            # someone else opened a session — back off hard
-            wait = min(120, 15 * farm._conflict_streak)
-            log(f"cooldown {wait}s — kill other farm/browser tab on this account")
+            wait = min(90, 12 * farm._conflict_streak)
+            log(f"superseded streak={farm._conflict_streak} cooldown {wait}s (kill other client)")
             time.sleep(wait)
             try:
                 farm.session_start()
             except Exception as e2:
                 log(f"reauth fail {e2}")
-                time.sleep(10)
+                time.sleep(8)
         except RateLimited as e:
             farm._conflict_streak += 1
-            wait = e.wait * min(farm._conflict_streak, 4)
-            log(f"409/rate — sleep {wait:.0f}s")
+            wait = e.wait * min(farm._conflict_streak, 3)
+            log(f"409 sleep {wait:.0f}s")
             time.sleep(wait)
             try:
                 farm.session_start()
@@ -422,15 +423,15 @@ def main() -> None:
         except Exception as e:
             log(f"game err {e}")
             if "409" in str(e) or "superseded" in str(e).lower():
-                time.sleep(30)
+                time.sleep(25)
             try:
                 farm.session_start()
             except Exception as e2:
                 log(f"reauth fail {e2}")
-                time.sleep(5)
-            time.sleep(3)
+                time.sleep(4)
+            time.sleep(2)
         if GAMES == 0 or i < GAMES:
-            time.sleep(DELAY_BETWEEN_GAMES + random.uniform(0, 2))
+            time.sleep(DELAY_BETWEEN_GAMES + random.uniform(0, 0.8))
 
 
 if __name__ == "__main__":
